@@ -1,97 +1,67 @@
 #!/usr/bin/env python
-from boto.dynamodb2.exceptions import ValidationException
-from boto.dynamodb2.fields import HashKey, RangeKey
-from boto.dynamodb2.layer1 import DynamoDBConnection
-from boto.dynamodb2.table import Table
-from boto.exception import JSONResponseError
-from time import sleep
+import boto3
 import sys
-import os
 
-if len(sys.argv) != 3:
-    print("Usage: %s <source_table_name> <destination_table_name>"% sys.argv[0])
-    sys.exit(1)
+####
+#### Usage: python dynamodb-copy-table.py <srcTable> <dstTable> [dstTableRegion] [dstTableProfile]
+#### source table region will get picked up from environment variables
+#### if target table region is different than source region, pass it as 3rd argument to script
+#### source table credentials are picked up from environment
+#### if target table credentials are different from source, pass it as 4rd argument to the script as local profile name
 
 src_table = sys.argv[1]
 dst_table = sys.argv[2]
-region = os.getenv('AWS_DEFAULT_REGION', 'us-west-2')
 
-# host = 'dynamodb.%s.amazonaws.com' % region
-# ddbc = DynamoDBConnection(is_secure=False, region=region, host=host)
-DynamoDBConnection.DefaultRegionName = region
-ddbc = DynamoDBConnection()
+print(f"DynamoDB: copy items {src_table} --> {dst_table}")
 
-# 1. Read and copy the target table to be copied
-table_struct = None
-try:
-    logs = Table(src_table, connection=ddbc)
-    table_struct = logs.describe()
-except JSONResponseError:
-    print("Table %s does not exist" % src_table) 
-    sys.exit(1)
+dst_region = None
+dst_profile = None
 
-print("*** Reading key schema from %s table" % src_table)
-src = ddbc.describe_table(src_table)['Table']
-hash_key = ''
-range_key = ''
-for schema in src['KeySchema']:
-    attr_name = schema['AttributeName']
-    key_type = schema['KeyType']
-    if key_type == 'HASH':
-        hash_key = attr_name
-    elif key_type == 'RANGE':
-        range_key = attr_name
+if len(sys.argv) > 3:
+  dst_region = sys.argv[3]
+if len(sys.argv) > 4:
+  dst_profile = sys.argv[4]
 
-# 2. Create the new table
-table_struct = None
-try:
-    new_logs = Table(dst_table,
-                    connection=ddbc,
-                    schema=[HashKey(hash_key),
-                            RangeKey(range_key),
-                            ]
-                    )
+# create client
+src_client = boto3.client('dynamodb')
+dst_client = src_client
+if dst_region is not None:
+  if dst_profile is not None:
+     dst_client = boto3.Session(profile_name=dst_profile).client('dynamodb', region_name= dst_region)
+  else:
+     dst_client = boto3.client('dynamodb', region_name= dst_region)
 
-    table_struct = new_logs.describe()
-    if 'DISABLE_CREATION' in os.environ:
-        print("Creation of new table is disabled. Skipping...")
+
+# scan
+dynamo_items = []
+api_response = src_client.scan(TableName=src_table,Select='ALL_ATTRIBUTES')
+dynamo_items.extend(api_response['Items'])
+print(f"Collected total {len(dynamo_items)} items from table {src_table}")
+
+while 'LastEvaluatedKey' in api_response:
+    api_response = src_client.scan(TableName=src_table,
+        Select='ALL_ATTRIBUTES',
+        ExclusiveStartKey=api_response['LastEvaluatedKey'])
+    dynamo_items.extend(api_response['Items'])
+    print(f"Collected total {len(dynamo_items)} items from table {src_table}")
+
+# split all items into chunks, not very optimal as memory allocation is doubled,
+# though this script not intended for unattented execution, so it shoudl be fine
+chunk_size = 20
+current_chunk = []
+chunks = [current_chunk]
+for item in dynamo_items:
+    current_chunk.append(item)
+    if len(current_chunk) == chunk_size:
+        current_chunk = []
+        chunks.append(current_chunk)
+
+for index, chunk in enumerate(chunks):
+    print(f"Writing chunk {index+1} out of {len(chunks)} to table {dst_table}")
+    if len(chunk) > 0:
+        write_request = {}
+        write_request[dst_table] = list(map(lambda x:{'PutRequest':{'Item':x}}, chunk))
+        # TODO error handling, failed write items, max is 16MB, but there are throughput limitations as well
+        dst_client.batch_write_item(RequestItems=write_request)
     else:
-        print("Table %s already exists" % dst_table)
-        sys.exit(0)
-except JSONResponseError:
-    schema = [HashKey(hash_key)]
-    if range_key != '':
-        schema.append(RangeKey(range_key))
-    new_logs = Table.create(dst_table,
-                            connection=ddbc,
-                            schema=schema,
-                            )
-    print("*** Waiting for the new table %s to become active" % dst_table)
-    sleep(5)
-    while ddbc.describe_table(dst_table)['Table']['TableStatus'] != 'ACTIVE':
-        sleep(3)
-    
-
-if 'DISABLE_DATACOPY' in os.environ:
-    print("Copying of data from source table is disabled. Exiting...")
-    sys.exit(0)
-
-# 3. Add the items
-for item in logs.scan():
-    new_item = {}
-    new_item[hash_key] = item[hash_key]
-    if range_key != '':
-        new_item[range_key] = item[range_key]
-    for f in item.keys():
-        if f in [hash_key, range_key]:
-            continue
-        new_item[f] = item[f]
-    try:
-        new_logs.use_boolean()
-        new_logs.put_item(new_item, overwrite=True)
-    except ValidationException:
-        print(dst_table, new_item)
-    except JSONResponseError:
-        print(ddbc.describe_table(dst_table)['Table']['TableStatus'])
-
-print("We are done. Exiting...")
+        print("No items in chunk - chunk empty")
